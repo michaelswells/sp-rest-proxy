@@ -5,8 +5,8 @@
 
 import RestProxy from '../src/RestProxy';
 
-(new RestProxy({
-    configPath: './config/private.json'
-})).serveClient({
-    serverUrl: 'http://localhost:9867'
+new RestProxy({
+  configPath: './config/private.json'
+}).serveClient({
+  serverUrl: 'http://localhost:9867'
 });

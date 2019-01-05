@@ -5,159 +5,132 @@ import * as express from 'express';
 import * as bodyParser from 'body-parser';
 import * as cors from 'cors';
 
-import { generateGuid } from '../utils';
-import { IGatewayServerSettings, IProxySettings } from '../interfaces';
-import { Application } from 'express';
+import { generateGuid } from '../utils/misc';
+import { IGatewayServerSettings, IProxySettings } from '../core/interfaces';
+import { Logger } from '../utils/logger';
 
 export class Server {
 
-    private settings: IGatewayServerSettings;
-    private proxy: IProxySettings;
+  private server: http.Server;
+  private io: SocketIO.Server;
+  private socket: SocketIO.Socket;
+  private logger: Logger;
 
-    private server: http.Server;
-    private io: SocketIO.Server;
-    private socket: SocketIO.Socket;
-    private app: Application;
+  constructor (
+    private settings: IGatewayServerSettings,
+    private proxy: IProxySettings,
+    private app: express.Application
+  ) {
+    this.server = http.createServer(this.app);
+    this.io = SocketIO(this.server);
+    this.logger = new Logger(proxy.logLevel);
+  }
 
-    constructor(settings: IGatewayServerSettings, proxy: IProxySettings, app: Application) {
-        this.app = app;
-        this.server = http.createServer(this.app);
-        this.io = SocketIO(this.server);
-        this.settings = settings;
-        this.proxy = proxy;
-    }
+  public init = (): void => {
+    this.server.listen(this.settings.port || this.proxy.port);
+    this.io.on('connection', socket => {
 
-    public init = () => {
-        this.server.listen(this.settings.port || this.proxy.port);
-        this.io.on('connection', (socket) => {
+      this.socket = socket;
 
-            this.socket = socket;
-
-            let bodyParserRaw = bodyParser.raw({
-                type: '*/*',
-                limit: this.proxy.rawBodyLimitSize,
-                verify: (req, res, buf, encoding) => {
-                    if (buf && buf.length) {
-                        req.rawBody = buf.toString(encoding || 'utf8');
-                        req.buffer = buf;
-                    }
-                }
-            });
-
-            // REST - GET requests (JSON)
-            this.app.get('*/_api/*', this.getTransmitter);
-
-            // REST - Files and attachments
-            this.app.post('*/_api/*(/attachmentfiles/add|/files/add)*', bodyParserRaw, this.postTransmitter);
-
-            // REST - Batch requests
-            this.app.post('*/_api/[$]batch', bodyParserRaw, this.postTransmitter);
-
-            // REST - POST requests (JSON)
-            this.app.post('*/_api/*', bodyParser.json({ limit: this.proxy.jsonPayloadLimitSize }), this.postTransmitter);
-
-            //  CSOM/SOAP requests (XML)
-            this.app.post('*/_vti_bin/*', this.postTransmitter);
-
-            // Static router
-            this.app.get('*', this.getTransmitter);
-
-            this.app.use(bodyParser.urlencoded({ extended: true }));
-            this.app.use(cors());
-
-        });
-    }
-
-    private getTransmitter = (req: express.Request, res: express.Response) => {
-        const transaction = generateGuid();
-
-        if (!this.proxy.silentMode) {
-            console.log('\nGET: ' + req.originalUrl);
+      const bodyParserRaw = bodyParser.raw({
+        type: '*/*',
+        limit: this.proxy.rawBodyLimitSize,
+        verify: (req, _res, buf, encoding) => {
+          if (buf && buf.length) {
+            (req as any).rawBody = buf.toString(encoding || 'utf8');
+            (req as any).buffer = buf;
+          }
         }
+      });
 
-        const responseCallback = (data) => {
-            if (data.transaction === transaction) {
-                let statusCode = data.response.statusCode;
-                let body = data.response.body;
+      // REST - GET requests (JSON)
+      this.app.get('*/_api/*', this.getTransmitter);
 
-                try {
-                    body = JSON.parse(body);
-                } catch (ex) {
-                    //
-                }
+      // REST - Files and attachments
+      this.app.post('*/_api/*(/attachmentfiles/add|/files/add)*', bodyParserRaw, this.postTransmitter);
 
-                res.status(statusCode);
-                res.contentType(data.response.headers['content-type']);
+      // REST - Batch requests
+      this.app.post('*/_api/[$]batch', bodyParserRaw, this.postTransmitter);
 
-                res.send(body);
+      // REST - POST requests (JSON)
+      this.app.post('*/_api/*', bodyParser.json({ limit: this.proxy.jsonPayloadLimitSize }), this.postTransmitter);
 
-                this.socket.removeListener('RESPONSE', responseCallback);
-            }
-        };
-        this.socket.on('RESPONSE', responseCallback);
+      //  CSOM/SOAP requests (XML)
+      this.app.post('*/_vti_bin/*', this.postTransmitter);
 
-        let request = {
-            url: req.originalUrl,
-            method: 'GET',
-            headers: req.headers,
-            transaction: transaction
-        };
-        this.io.emit('REQUEST', request);
-    }
+      // Static router
+      this.app.get('*', this.getTransmitter);
 
-    private postTransmitter = (req: express.Request, res: express.Response) => {
-        const transaction = generateGuid();
+      this.app.use(bodyParser.urlencoded({ extended: true }));
+      this.app.use(cors());
 
-        if (!this.proxy.silentMode) {
-            console.log('\nPOST: ' + req.originalUrl);
+    });
+  }
+
+  private getTransmitter = (req: express.Request, res: express.Response): void => {
+    const transaction = generateGuid();
+    this.logger.info('\nGET: ' + req.originalUrl);
+    const responseCallback = data => {
+      if (data.transaction === transaction) {
+        const statusCode = data.response.statusCode;
+        let body = data.response.body;
+        try { body = JSON.parse(body); } catch (ex) { /**/ }
+        res.status(statusCode);
+        res.contentType(data.response.headers['content-type']);
+        res.send(body);
+        this.socket.removeListener('RESPONSE', responseCallback);
+      }
+    };
+    this.socket.on('RESPONSE', responseCallback);
+    const request = {
+      url: req.originalUrl,
+      method: 'GET',
+      headers: req.headers,
+      transaction: transaction
+    };
+    this.io.emit('REQUEST', request);
+  }
+
+  private postTransmitter = (req: express.Request, res: express.Response): void => {
+    const transaction = generateGuid();
+    this.logger.info('\nPOST: ' + req.originalUrl);
+    const responseCallback = data => {
+      if (data.transaction === transaction) {
+        const statusCode = data.response.statusCode;
+        let body = data.response.body;
+        try { body = JSON.parse(body); } catch (ex) { /**/ }
+        res.status(statusCode);
+        res.json(body);
+        this.socket.removeListener('RESPONSE', responseCallback);
+      }
+    };
+    this.socket.on('RESPONSE', responseCallback);
+    const extractPostRequestBody = (request: express.Request, callback?: (body: any) => void): void => {
+      let reqBody = '';
+      if (request.body) {
+        reqBody = request.body;
+        if (callback && typeof callback === 'function') {
+          callback(reqBody);
         }
-
-        const responseCallback = (data) => {
-            if (data.transaction === transaction) {
-                let statusCode = data.response.statusCode;
-                let body = data.response.body;
-                try {
-                    body = JSON.parse(body);
-                } catch (ex) {
-                    //
-                }
-                res.status(statusCode);
-                res.json(body);
-                this.socket.removeListener('RESPONSE', responseCallback);
-            }
-        };
-        this.socket.on('RESPONSE', responseCallback);
-
-        const extractPostRequestBody = (request: express.Request, callback: Function): void => {
-            let reqBody = '';
-
-            if (request.body) {
-                reqBody = request.body;
-                if (callback && typeof callback === 'function') {
-                    callback(reqBody);
-                }
-            } else {
-                request.on('data', (chunk) => {
-                    reqBody += chunk;
-                });
-                request.on('end', () => {
-                    if (callback && typeof callback === 'function') {
-                        callback(reqBody);
-                    }
-                });
-            }
-        };
-
-        extractPostRequestBody(req, (body: any) => {
-            let request = {
-                url: req.originalUrl,
-                method: 'POST',
-                headers: req.headers,
-                body: body,
-                transaction: transaction
-            };
-            this.io.emit('REQUEST', request);
+      } else {
+        request.on('data', chunk => reqBody += chunk);
+        request.on('end', () => {
+          if (callback && typeof callback === 'function') {
+            callback(reqBody);
+          }
         });
-    }
+      }
+    };
+    extractPostRequestBody(req, body => {
+      const request = {
+        url: req.originalUrl,
+        method: 'POST',
+        headers: req.headers,
+        body: body,
+        transaction: transaction
+      };
+      this.io.emit('REQUEST', request);
+    });
+  }
 
 }
